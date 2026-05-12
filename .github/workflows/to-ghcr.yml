@@ -22,6 +22,24 @@ jobs:
     - uses: actions/setup-go@v5
     - uses: imjasonh/setup-crane@v0.4
     - run: |
-        for tag in $(crane ls ${{ matrix.image }}); do
-          crane copy ${{ matrix.image }}:$tag ghcr.io/${{ github.repository_owner }}/$(echo ${{ matrix.image }} | cut -d'/' -f2 | cut -d':' -f1):$tag
+        set -euo pipefail
+
+        image="${{ matrix.image }}"
+        package_name="$(echo "$image" | cut -d'/' -f2 | cut -d':' -f1)"
+        destination="ghcr.io/${{ github.repository_owner }}/${package_name}"
+        cutoff_epoch="$(date -u -d '3 months ago' +%s)"
+        next_url="https://hub.docker.com/v2/repositories/${image}/tags?page_size=100"
+
+        while [ -n "$next_url" ] && [ "$next_url" != "null" ]; do
+          response="$(curl -fsSL "$next_url")"
+
+          while IFS=$'\t' read -r tag updated_at; do
+            [ -z "$tag" ] && continue
+            updated_epoch="$(date -u -d "$updated_at" +%s 2>/dev/null || echo 0)"
+            if [ "$updated_epoch" -ge "$cutoff_epoch" ]; then
+              crane copy "${image}:${tag}" "${destination}:${tag}"
+            fi
+          done < <(echo "$response" | jq -r '.results[] | [.name, .last_updated] | @tsv')
+
+          next_url="$(echo "$response" | jq -r '.next')"
         done

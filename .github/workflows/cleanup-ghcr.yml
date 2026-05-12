@@ -1,0 +1,87 @@
+name: cleanup old ghcr images
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 0 * * 0'
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - binfmt
+          - buildkit
+    steps:
+      - uses: actions/setup-go@v5
+      - uses: imjasonh/setup-crane@v0.4
+      - env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          PACKAGE_NAME: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            api_owner_path="orgs/${OWNER}"
+          else
+            api_owner_path="users/${OWNER}"
+          fi
+
+          cutoff_epoch="$(date -u -d '2 years ago' +%s)"
+          api_base="https://api.github.com/${api_owner_path}/packages/container/${PACKAGE_NAME}/versions"
+          image_ref="ghcr.io/${OWNER}/${PACKAGE_NAME}"
+
+          all_versions='[]'
+          page=1
+          while true; do
+            response="$(curl -fsSL \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${api_base}?per_page=100&page=${page}")"
+            length="$(echo "$response" | jq 'length')"
+            if [ "$length" -eq 0 ]; then
+              break
+            fi
+            all_versions="$(jq -cs '.[0] + .[1]' <(echo "$all_versions") <(echo "$response"))"
+            page="$((page + 1))"
+          done
+
+          protected_digests="$(mktemp)"
+          : > "$protected_digests"
+
+          while IFS= read -r digest; do
+            [ -z "$digest" ] && continue
+            manifest="$(crane manifest "${image_ref}@${digest}" 2>/dev/null || true)"
+            if [ -z "$manifest" ]; then
+              continue
+            fi
+
+            media_type="$(echo "$manifest" | jq -r '.mediaType // empty')"
+            case "$media_type" in
+              *manifest.list.v2+json|*image.index.v1+json)
+                echo "$manifest" | jq -r '.manifests[]?.digest // empty' >> "$protected_digests"
+                ;;
+            esac
+          done < <(echo "$all_versions" | jq -r --argjson cutoff "$cutoff_epoch" '.[] | select((.created_at | fromdateiso8601) >= $cutoff) | .name')
+
+          sort -u "$protected_digests" -o "$protected_digests"
+
+          while IFS=$'\t' read -r version_id digest; do
+            [ -z "$version_id" ] && continue
+            if grep -Fxq "$digest" "$protected_digests"; then
+              continue
+            fi
+
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${api_base}/${version_id}" > /dev/null
+          done < <(echo "$all_versions" | jq -r --argjson cutoff "$cutoff_epoch" '.[] | select((.created_at | fromdateiso8601) < $cutoff) | [.id, .name] | @tsv')
